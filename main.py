@@ -47,7 +47,7 @@ WITHDRAW_GROUP_ID = -1002938188891  # yechib olish so'rovlari guruhiga yuborilad
 AWARD = 500        # 500 so‘m
 PENALTY = 100
 FIRST_MIN = 1000
-NEXT_MIN = 15000
+NEXT_MIN = 5000
 
 # ---------- SUPABASE ----------
 SUPABASE_URL = "https://bnuleyjyjdwvkzwcyalf.supabase.co"
@@ -826,3 +826,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
