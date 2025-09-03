@@ -1,2 +1,8 @@
 aiogram==3.4.1
 Telethon==1.40.0
+python-dotenv==1.0.1
+aiogram==2.25.1
+supabase==1.0.3
+openai==1.97.0
+pyTelegramBotAPI==4.23.0
+
