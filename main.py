@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 # Aiogram 3.x
-# pip install aiogram
+# pip install aiogram supabase
 
 import asyncio
 import logging
-import sqlite3
 import datetime
 from datetime import timedelta
 import urllib.parse
-import shutil
 import os
+from typing import Optional, Dict, List, Tuple
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import StateFilter
@@ -22,7 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-import gzip
+from supabase import create_client, Client  # <-- SUPABASE
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,7 +31,7 @@ CHANNEL = "@uyzar_elonlar"
 
 # YANGI majburiy kanal
 SECOND_CHANNEL = "@zarafshon_kanal"
-# Ikkala kanal (gate va penalty shu ro‘yxat bo‘yicha ishlaydi)
+# Ikkala kanal ro‘yxati (gate va penalty shu ro‘yxat bo‘yicha ishlaydi)
 MANDATORY_CHANNELS = [CHANNEL, SECOND_CHANNEL]
 
 # Majburiy bot (faqat /start bosilganini tekshirish uchun)
@@ -50,23 +49,16 @@ PENALTY = 100
 FIRST_MIN = 1000
 NEXT_MIN = 15000
 
-# ======== PERSISTENT DB sozlamalari ========
-DB_DIR = os.getenv("DB_DIR", "/data")
-try:
-    os.makedirs(DB_DIR, exist_ok=True)
-except Exception:
-    DB_DIR = "."
-DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR, "bot.db"))
-DB_BACKUP = os.getenv("DB_BACKUP", os.path.join(DB_DIR, "bot.db.bak"))
-# ===========================================
+# ---------- SUPABASE ----------
+SUPABASE_URL = "https://bnuleyjyjdwvkzwcyalf.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJudWxleWp5amR3dmt6d2N5YWxmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDkzMDE5ODMsImV4cCI6MjAyNDg3Nzk4M30.UG-EKAXRYDDZANFwOKhM_0daycSutmC3DBqf-SLy3SU"
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-TG_BACKUP = True
-API_ID = 16072756           # fill with my real API ID
-API_HASH = "5fc7839a0d020c256e5c901cebd21bb7" # fill with my real API HASH
-TG_SESSION = "db_backup"
-BACKUP_CHAT = "@dbpul"  # or "me"
-DB_BACKUP_EVERY_MIN = 1
-conn: sqlite3.Connection | None = None
+# Jadval nomlari (Siz bergan sxemaga mos)
+TBL_USERS = "userpul"
+TBL_REFS = "referralpul"
+TBL_WITHDRAWS = "withdrawpul"
+TBL_PENDING = "pendingpul"
 
 # -------- Button labels
 BTN_REF_MAIN   = "👥 Do‘st taklif qilib pul ishlash 💰"
@@ -84,183 +76,167 @@ BTN_TOPREF     = "📈 Xarakat qilayotganlar"
 MAIN_BTNS = {BTN_REF_MAIN, BTN_HELP, BTN_ADMIN}
 REF_BTNS  = {BTN_LINK, BTN_BALANCE, BTN_WITHDRAW, BTN_RULES, BTN_BACK}
 
-# ================== DB ==================
-def _restore_db_if_needed():
-    try:
-        if (not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) < 1024) and os.path.exists(DB_BACKUP):
-            shutil.copyfile(DB_BACKUP, DB_PATH)
-    except Exception:
-        pass
-
-def _sqlite_connect(path: str):
-    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.execute("PRAGMA busy_timeout=5000;")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-    except Exception:
-        pass
-    return conn
-
-def _make_backup(conn: sqlite3.Connection, dst: str):
-    try:
-        bconn = sqlite3.connect(dst)
-        with bconn:
-            conn.backup(bconn)
-        bconn.close()
-    except Exception:
-        try:
-            shutil.copyfile(DB_PATH, dst)
-        except Exception:
-            pass
-
-async def _periodic_backup_task():
-    while True:
-        await asyncio.sleep(1800)  # 30 min
-        try:
-            _make_backup(conn, DB_BACKUP)
-        except Exception:
-            pass
-
-# ======== faqat yo‘q bo‘lsa yaratish ========
-REQUIRED_TABLES = {"users", "referrals", "withdrawals", "pending_refs"}
-
-def _has_required_schema(c: sqlite3.Connection) -> bool:
-    rows = c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    names = {r[0] for r in rows}
-    return REQUIRED_TABLES.issubset(names)
-
-def ensure_db():
-    _restore_db_if_needed()
-    c = _sqlite_connect(DB_PATH)
-    if not _has_required_schema(c):
-        cur = c.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 0,
-            referrer_id INTEGER,
-            has_withdrawn INTEGER DEFAULT 0
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS referrals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            invited_id INTEGER,
-            join_time TEXT,
-            penalized INTEGER DEFAULT 0,
-            done INTEGER DEFAULT 0
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount INTEGER,
-            card_number TEXT,
-            full_name TEXT,
-            created_at TEXT
-        )
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS pending_refs(
-            referee_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER,
-            created_at TEXT
-        )
-        """)
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ref_invited ON referrals(invited_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id)")
-        c.commit()
-        try:
-            _make_backup(c, DB_BACKUP)
-        except Exception:
-            pass
-    return c
-
-async def _tg_restore_if_needed():
-    if not TG_BACKUP or API_ID == 0 or not API_HASH:
-        return
-    try:
-        need_restore = (not os.path.exists(DB_PATH)) or (os.path.getsize(DB_PATH) < 1024)
-    except Exception:
-        need_restore = True
-    if not need_restore:
-        return
-    try:
-        from telethon import TelegramClient
-        client = TelegramClient("bot_backup_restore", API_ID, API_HASH)
-        await client.start(bot_token=TOKEN)
-        async for m in client.iter_messages(BACKUP_CHAT, limit=50):
-            if getattr(m, "document", None) and m.file and str(m.file.name).endswith(".db.gz"):
-                tmp_gz = DB_BACKUP + ".restore.gz"
-                await client.download_media(m, tmp_gz)
-                with gzip.open(tmp_gz, "rb") as src, open(DB_PATH, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                os.remove(tmp_gz)
-                break
-        await client.disconnect()
-        logging.info("DB restore: done")
-    except Exception as e:
-        logging.exception("DB restore failed: %s", e)
-
-async def _tg_periodic_backup():
-    if not TG_BACKUP or API_ID == 0 or not API_HASH:
-        return
-    from telethon import TelegramClient
-    while True:
-        await asyncio.sleep(DB_BACKUP_EVERY_MIN * 60)
-        try:
-            if not os.path.exists(DB_PATH):
-                continue
-            tmp_gz = DB_BACKUP + ".gz"
-            with gzip.open(tmp_gz, "wb") as gz, open(DB_PATH, "rb") as src:
-                shutil.copyfileobj(src, gz)
-            client = TelegramClient("bot_backup_loop", API_ID, API_HASH)
-            await client.start(bot_token=TOKEN)
-            ts = datetime.datetime.utcnow().isoformat(timespec="seconds")
-            await client.send_file(BACKUP_CHAT, tmp_gz, caption=f"bot.db.gz • {ts}")
-            await client.disconnect()
-            os.remove(tmp_gz)
-            logging.info("DB backup sent")
-        except Exception as e:
-            logging.exception("DB backup failed: %s", e)
-
 # ================== BOT ==================
 bot = Bot(token=TOKEN)
-helper_bot = Bot(token=HELPER_BOT_TOKEN)
+helper_bot = Bot(token=HELPER_BOT_TOKEN)  # faqat tekshiruv uchun
 dp = Dispatcher(storage=MemoryStorage())
 BOT_USERNAME = None
 
-def esc(s: str | None) -> str:
+def esc(s: Optional[str]) -> str:
     return "" if not s else s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-def mention(uid: int, username: str | None, fb: str = "Profil") -> str:
+def mention(uid: int, username: Optional[str], fb: str = "Profil") -> str:
     return f"@{username}" if username else f"<a href='tg://user?id={uid}'>{fb}</a>"
+
+# ================== SUPABASE DB ADAPTER ==================
+class DB:
+    # ---- USERS ----
+    @staticmethod
+    def get_user(uid: int) -> Optional[Dict]:
+        resp = sb.table(TBL_USERS).select("*").eq("id", uid).limit(1).execute()
+        return resp.data[0] if resp.data else None
+
+    @staticmethod
+    def insert_user(uid: int, username: Optional[str], referrer_id: Optional[int]):
+        sb.table(TBL_USERS).upsert({
+            "id": uid,
+            "username": username,
+            "balance": 0,
+            "referrer_id": referrer_id,
+            "has_withdrawn": False
+        }, on_conflict="id").execute()
+
+    @staticmethod
+    def update_username(uid: int, username: Optional[str]):
+        sb.table(TBL_USERS).update({"username": username}).eq("id", uid).execute()
+
+    @staticmethod
+    def add_balance(uid: int, amount: int):
+        u = DB.get_user(uid)
+        cur = u.get("balance", 0) if u else 0
+        sb.table(TBL_USERS).update({"balance": cur + amount}).eq("id", uid).execute()
+
+    @staticmethod
+    def sub_balance_floor(uid: int, amount: int):
+        u = DB.get_user(uid)
+        cur = u.get("balance", 0) if u else 0
+        newv = cur - amount
+        if newv < 0: newv = 0
+        sb.table(TBL_USERS).update({"balance": newv}).eq("id", uid).execute()
+
+    @staticmethod
+    def mark_first_withdrawn(uid: int):
+        u = DB.get_user(uid)
+        if u and not u.get("has_withdrawn", False):
+            sb.table(TBL_USERS).update({"has_withdrawn": True}).eq("id", uid).execute()
+
+    # ---- REFERRALS ----
+    @staticmethod
+    def insert_referral(referrer_id: int, invited_id: int, join_time_iso: str):
+        sb.table(TBL_REFS).insert({
+            "referrer_id": referrer_id,
+            "invited_id": invited_id,
+            "join_time": join_time_iso,
+            "penalized": False,
+            "done": False
+        }).execute()
+
+    @staticmethod
+    def open_referrals() -> List[Dict]:
+        resp = sb.table(TBL_REFS).select("*").eq("penalized", False).eq("done", False).execute()
+        return resp.data or []
+
+    @staticmethod
+    def mark_referral_done(rid: int):
+        sb.table(TBL_REFS).update({"done": True}).eq("id", rid).execute()
+
+    @staticmethod
+    def mark_referral_penalized(rid: int):
+        sb.table(TBL_REFS).update({"penalized": True}).eq("id", rid).execute()
+
+    @staticmethod
+    def get_invited_by(referrer_id: int) -> List[Tuple[int, Optional[str]]]:
+        # 1) referrals
+        r = sb.table(TBL_REFS).select("invited_id").eq("referrer_id", referrer_id).order("id", desc=True).execute()
+        ids = [row["invited_id"] for row in (r.data or [])]
+        if not ids:
+            return []
+        # 2) usernames
+        # split in chunks (PostgREST 'in' limited length), but for simplicity once:
+        u = sb.table(TBL_USERS).select("id,username").in_("id", ids).execute()
+        umap = {row["id"]: row.get("username") for row in (u.data or [])}
+        return [(i, umap.get(i)) for i in ids]
+
+    # ---- PENDING ----
+    @staticmethod
+    def upsert_pending(referee_id: int, referrer_id: int, created_at_iso: str):
+        sb.table(TBL_PENDING).upsert({
+            "referee_id": referee_id,
+            "referrer_id": referrer_id,
+            "created_at": created_at_iso
+        }, on_conflict="referee_id").execute()
+
+    @staticmethod
+    def pop_pending(referee_id: int) -> Optional[int]:
+        r = sb.table(TBL_PENDING).select("referrer_id").eq("referee_id", referee_id).limit(1).execute()
+        if not r.data:
+            return None
+        ref = r.data[0]["referrer_id"]
+        sb.table(TBL_PENDING).delete().eq("referee_id", referee_id).execute()
+        return ref
+
+    # ---- WITHDRAWALS ----
+    @staticmethod
+    def insert_withdrawal(uid: int, amount: int, card_number: str, full_name: str, created_at_iso: str):
+        sb.table(TBL_WITHDRAWS).insert({
+            "user_id": uid,
+            "amount": amount,
+            "card_number": card_number,
+            "full_name": full_name,
+            "created_at": created_at_iso
+        }).execute()
+
+    # ---- STATS ----
+    @staticmethod
+    def count_users() -> int:
+        r = sb.table(TBL_USERS).select("id", count="exact", head=True).execute()
+        return r.count or 0
+
+    @staticmethod
+    def count_withdraw_users() -> int:
+        r = sb.table(TBL_WITHDRAWS).select("user_id").execute()
+        users = {row["user_id"] for row in (r.data or [])}
+        return len(users)
+
+    @staticmethod
+    def sum_balances(exclude_id: Optional[int] = None) -> int:
+        q = sb.table(TBL_USERS).select("id,balance")
+        if exclude_id is not None:
+            q = q.neq("id", exclude_id)
+        r = q.execute()
+        return sum((row.get("balance", 0) or 0) for row in (r.data or []))
 
 # ================== PENALTY MONITOR (24h) ==================
 async def check_pendings():
     while True:
-        await asyncio.sleep(600)
+        await asyncio.sleep(600)  # 10 daqiqa
         now = datetime.datetime.utcnow()
-        rows = conn.execute(
-            "SELECT id, referrer_id, invited_id, join_time FROM referrals WHERE penalized=0 AND done=0"
-        ).fetchall()
-        for rid, ref_id, inv_id, jt in rows:
+        rows = DB.open_referrals()
+        for ref in rows:
+            rid = ref["id"]
+            ref_id = ref["referrer_id"]
+            inv_id = ref["invited_id"]
+            jt = ref.get("join_time")
             try:
-                join_t = datetime.datetime.fromisoformat(jt)
+                join_t = datetime.datetime.fromisoformat(jt.replace("Z","")) if isinstance(jt, str) else now
             except Exception:
                 join_t = now
-            hours = (now - join_t).total_seconds() / 3600
+            hours = (now - join_t.replace(tzinfo=None)).total_seconds() / 3600 if isinstance(join_t, datetime.datetime) else 0
             if hours > 24:
-                conn.execute("UPDATE referrals SET done=1 WHERE id=?", (rid,))
-                conn.commit()
+                DB.mark_referral_done(rid)
                 continue
 
+            # Ikkala kanal bo‘yicha tekshiruv: istalgan birida a’zo bo‘lmasa → jarima
             in_all = True
             for ch in MANDATORY_CHANNELS:
                 try:
@@ -273,15 +249,11 @@ async def check_pendings():
                     break
 
             if not in_all:
-                conn.execute("""
-                    UPDATE users
-                    SET balance = CASE WHEN balance>=? THEN balance-? ELSE 0 END
-                    WHERE id=?
-                """, (PENALTY, PENALTY, ref_id))
-                conn.execute("UPDATE referrals SET penalized=1 WHERE id=?", (rid,))
-                conn.commit()
-                u = conn.execute("SELECT username FROM users WHERE id=?", (inv_id,)).fetchone()
-                uname = u[0] if u else None
+                DB.sub_balance_floor(ref_id, PENALTY)
+                DB.mark_referral_penalized(rid)
+                # Taklifchiga xabar
+                u = DB.get_user(inv_id)
+                uname = u.get("username") if u else None
                 try:
                     await bot.send_message(
                         ref_id,
@@ -374,17 +346,13 @@ class WD(StatesGroup):
 
 # ================== STARTUP ==================
 async def on_startup():
-    global BOT_USERNAME, conn
+    global BOT_USERNAME
     me = await bot.get_me()
     BOT_USERNAME = me.username
-    await _tg_restore_if_needed()
-    conn = ensure_db()
-    asyncio.create_task(_periodic_backup_task())
     asyncio.create_task(check_pendings())
-    asyncio.create_task(_tg_periodic_backup())
 
 # ================== HELPERS ==================
-def parse_ref_arg(arg: str | None) -> int | None:
+def parse_ref_arg(arg: Optional[str]) -> Optional[int]:
     if not arg:
         return None
     a = arg.strip()
@@ -397,27 +365,16 @@ def parse_ref_arg(arg: str | None) -> int | None:
             return None
     return None
 
-def upsert_pending_ref(referee_id: int, referrer_id: int | None):
+def upsert_pending_ref(referee_id: int, referrer_id: Optional[int]):
     if not referrer_id or referrer_id == referee_id:
         return
-    conn.execute(
-        "INSERT INTO pending_refs(referee_id, referrer_id, created_at) VALUES(?,?,?) "
-        "ON CONFLICT(referee_id) DO UPDATE SET referrer_id=excluded.referrer_id, created_at=excluded.created_at",
-        (referee_id, referrer_id, datetime.datetime.utcnow().isoformat())
-    )
-    conn.commit()
+    DB.upsert_pending(referee_id, referrer_id, datetime.datetime.utcnow().isoformat())
 
-def pop_pending_ref(referee_id: int) -> int | None:
-    row = conn.execute("SELECT referrer_id FROM pending_refs WHERE referee_id=?", (referee_id,)).fetchone()
-    if not row:
-        return None
-    ref = row[0]
-    conn.execute("DELETE FROM pending_refs WHERE referee_id=?", (referee_id,))
-    conn.commit()
-    return ref
+def pop_pending_ref(referee_id: int) -> Optional[int]:
+    return DB.pop_pending(referee_id)
 
-# --- WELCOME (👋 Salom olib tashlandi, majburiyga ikki kanal qo‘shildi)
 WELCOME = (
+    "Assalomu alaykum, {name}! 👋\n\n"
     "💸 Bu Zarafshon Pul Boti. Do‘stlaringizni taklif qiling va mukofot oling.\n"
     "✅ Hammasi haqqoniy. To‘lovlar karta orqali amalga oshiriladi.\n"
     "🟢 Birinchi marta 1 000 so‘m yigsangiz yechib olishingiz mumkin.\n"
@@ -427,7 +384,7 @@ WELCOME = (
     "👇 Pastdagi tugmalardan foydalaning."
 )
 
-# =============== UNIVERSAL: menyu tugmasi bosilganda FSM tozalash ===============
+# =============== UNIVERSAL: har qanday menyu tugmasi bosilganda FSM tozalash ===============
 async def ensure_gate_and_clear_state(message: types.Message, state: FSMContext) -> bool:
     await state.clear()
     if not await gate_ok(message.from_user.id):
@@ -462,43 +419,32 @@ async def start(m: types.Message, state: FSMContext):
         )
         return
 
-    # Ism bilan salomlashish (faqat bitta salom)
-    full_name = (m.from_user.full_name or "Do‘st")
-    greet = f"Assalomu alaykum, {full_name}! 👋\n\n"
-
-    user_row = conn.execute("SELECT id FROM users WHERE id=?", (m.from_user.id,)).fetchone()
+    user_row = DB.get_user(m.from_user.id)
     final_ref = pop_pending_ref(m.from_user.id) or ref_from_link
 
     if not user_row:
-        if final_ref and final_ref != m.from_user.id:
-            ref_exists = conn.execute("SELECT id FROM users WHERE id=?", (final_ref,)).fetchone()
-            if ref_exists:
-                conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (AWARD, final_ref))
-                conn.execute(
-                    "INSERT INTO referrals(referrer_id, invited_id, join_time) VALUES(?,?,?)",
-                    (final_ref, m.from_user.id, datetime.datetime.utcnow().isoformat())
+        if final_ref and final_ref != m.from_user.id and DB.get_user(final_ref):
+            DB.add_balance(final_ref, AWARD)
+            DB.insert_referral(final_ref, m.from_user.id, datetime.datetime.utcnow().isoformat())
+            try:
+                await bot.send_message(
+                    final_ref,
+                    "🆕 <b>Yangi referral</b>\n"
+                    f"🧑‍🤝‍🧑 Yangi a’zo: {mention(m.from_user.id, m.from_user.username)} (ID: <code>{m.from_user.id}</code>)\n"
+                    f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
                 )
-                try:
-                    await bot.send_message(
-                        final_ref,
-                        "🆕 <b>Yangi referral</b>\n"
-                        f"🧑‍🤝‍🧑 Yangi a’zo: {mention(m.from_user.id, m.from_user.username)} (ID: <code>{m.from_user.id}</code>)\n"
-                        f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                except Exception:
-                    pass
-        conn.execute(
-            "INSERT INTO users(id, username, balance, referrer_id, has_withdrawn) VALUES(?,?,?,?,0)",
-            (m.from_user.id, m.from_user.username, 0, final_ref)
-        )
-        conn.commit()
+            except Exception:
+                pass
+        DB.insert_user(m.from_user.id, m.from_user.username, final_ref)
     else:
-        conn.execute("UPDATE users SET username=? WHERE id=?", (m.from_user.username, m.from_user.id))
-        conn.commit()
+        DB.update_username(m.from_user.id, m.from_user.username)
 
-    text = greet + WELCOME.format(helper=HELPER_BOT_USERNAME, chan1=CHANNEL, chan2=SECOND_CHANNEL)
+    text = WELCOME.format(
+        name=esc(m.from_user.full_name or ""),
+        helper=HELPER_BOT_USERNAME, chan1=CHANNEL, chan2=SECOND_CHANNEL
+    )
     await m.reply(text, reply_markup=kb_main(m.from_user.id in ADMINS), parse_mode="HTML")
 
 @dp.callback_query(lambda c: c.data == "gate_check")
@@ -507,34 +453,25 @@ async def gate_recheck(c: types.CallbackQuery):
         await c.answer("Hali shartlar bajarilmadi.", show_alert=True)
         return
 
-    user_row = conn.execute("SELECT id FROM users WHERE id=?", (c.from_user.id,)).fetchone()
+    user_row = DB.get_user(c.from_user.id)
     final_ref = pop_pending_ref(c.from_user.id)
 
     if not user_row:
-        if final_ref and final_ref != c.from_user.id:
-            ref_exists = conn.execute("SELECT id FROM users WHERE id=?", (final_ref,)).fetchone()
-            if ref_exists:
-                conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (AWARD, final_ref))
-                conn.execute(
-                    "INSERT INTO referrals(referrer_id, invited_id, join_time) VALUES(?,?,?)",
-                    (final_ref, c.from_user.id, datetime.datetime.utcnow().isoformat())
+        if final_ref and final_ref != c.from_user.id and DB.get_user(final_ref):
+            DB.add_balance(final_ref, AWARD)
+            DB.insert_referral(final_ref, c.from_user.id, datetime.datetime.utcnow().isoformat())
+            try:
+                await bot.send_message(
+                    final_ref,
+                    "🆕 <b>Yangi referral</b>\n"
+                    f"🧑‍🤝‍🧑 Yangi a’zo: {mention(c.from_user.id, c.from_user.username)} (ID: <code>{c.from_user.id}</code>)\n"
+                    f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
                 )
-                try:
-                    await bot.send_message(
-                        final_ref,
-                        "🆕 <b>Yangi referral</b>\n"
-                        f"🧑‍🤝‍🧑 Yangi a’zo: {mention(c.from_user.id, c.from_user.username)} (ID: <code>{c.from_user.id}</code>)\n"
-                        f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                except Exception:
-                    pass
-        conn.execute(
-            "INSERT INTO users(id, username, balance, referrer_id, has_withdrawn) VALUES(?,?,?,?,0)",
-            (c.from_user.id, c.from_user.username, 0, final_ref)
-        )
-        conn.commit()
+            except Exception:
+                pass
+        DB.insert_user(c.from_user.id, c.from_user.username, final_ref)
 
     try:
         await c.message.edit_text("✅ Tekshirildi. Davom etishingiz mumkin.")
@@ -568,12 +505,8 @@ async def help_menu(m: types.Message, state: FSMContext):
         "✅ <b>Shartlar</b>\n"
         f"• {HELPER_BOT_USERNAME} da <b>/start</b> bosilgan bo‘lishi shart.\n"
         f"• {CHANNEL} <b>va</b> {SECOND_CHANNEL} ga a’zo bo‘lish shart.\n"
-        "• 24 soat ichida taklif qilingan foydalanuvchi kanaldan chiqsa, <b>−100 so‘m</b> jarima.\n\n"
-        "💰 <b>Mukofotlar manbai</b>\n"
-        f"• To‘lovlar {CHANNEL} va {SECOND_CHANNEL} homiy budjetlaridan qoplanadi.\n\n"
-        "📞 <b>Aloqa</b>\n"
-        "• Telefon: <b>93 311 15 29</b>\n"
-        "• Telegram: <b>@Behruz_shokirov</b>",
+        "• 24 soat ichida taklif qilingan foydalanuvchi kanallardan chiqsa, <b>−100 so‘m</b> jarima.\n\n"
+        "💵 Mukofotlar <b>@uyzar_elonlar</b> va <b>@zarafshon_kanal</b> budjetidan to‘lanadi.",
         parse_mode="HTML",
         reply_markup=kb_main(m.from_user.id in ADMINS)
     )
@@ -596,56 +529,41 @@ async def my_balance(m: types.Message, state: FSMContext):
     if m.from_user.id == TEST_USER_ID:
         await m.reply(f"💰 Balans: {TEST_USER_BALANCE:,} so‘m (test) ♾️".replace(",", " "))
         return
-    row = conn.execute("SELECT balance, has_withdrawn FROM users WHERE id=?", (m.from_user.id,)).fetchone()
-    bal = row[0] if row else 0
-    has_w = row[1] if row else 0
-    need = FIRST_MIN if has_w == 0 else NEXT_MIN
+    u = DB.get_user(m.from_user.id)
+    bal = (u or {}).get("balance", 0)
+    has_w = (u or {}).get("has_withdrawn", False)
+    need = FIRST_MIN if not has_w else NEXT_MIN
     status = "✅ Hozir yechishingiz mumkin." if bal >= need else "⏳ Hali yetarli emas."
     await m.reply(f"💰 Balans: {bal} so‘m\n🎯 Minimal yechish: {need} so‘m\n{status}")
+
+# -------- Withdraw FSM
+class WD(StatesGroup):
+    amount = State()
+    card = State()
+    name = State()
+    confirm = State()
+
+def _is_any_menu(text: Optional[str]) -> bool:
+    if not text: return False
+    t = text.strip()
+    return t in MAIN_BTNS or t in REF_BTNS
 
 @dp.message(StateFilter("*"), F.text == BTN_WITHDRAW)
 async def wd_start(m: types.Message, state: FSMContext):
     if not await ensure_gate_and_clear_state(m, state): return
     if m.from_user.id == TEST_USER_ID:
         await state.set_state(WD.amount)
-        await m.reply(f"♾️ Test balans: {TEST_USER_BALANCE:,} so‘m.\n💸 Qancha yechamiz? Summani raqam bilan yuboring.")
+        await m.reply(f"♾️ Test balans: {TEST_USER_BALANCE:,} so‘m.\n💸 Qancha yechamiz? Summani raqam bilan yuboring.".replace(",", " "))
         return
-    row = conn.execute("SELECT balance, has_withdrawn FROM users WHERE id=?", (m.from_user.id,)).fetchone()
-    bal = row[0] if row else 0
-    has_w = row[1] if row else 0
-    need = FIRST_MIN if has_w == 0 else NEXT_MIN
+    u = DB.get_user(m.from_user.id)
+    bal = (u or {}).get("balance", 0)
+    has_w = (u or {}).get("has_withdrawn", False)
+    need = FIRST_MIN if not has_w else NEXT_MIN
     if bal < need:
         await m.reply(f"⚠️ Minimal yechib olish: {need} so‘m.\n💰 Sizda hozir: {bal} so‘m.")
         return
     await state.set_state(WD.amount)
     await m.reply(f"💸 Qancha yechamiz? (≤ {bal})\n🔢 Summani raqam bilan yuboring.")
-
-@dp.message(StateFilter("*"), F.text == BTN_RULES)
-async def rules(m: types.Message, state: FSMContext):
-    if not await ensure_gate_and_clear_state(m, state): return
-    await m.reply(
-        "📜 Qoidalar\n"
-        f"• Har bir haqiqiy taklif uchun {AWARD} so‘m beriladi.\n"
-        f"• Birinchi yechib olish: {FIRST_MIN} so‘m. Keyingi yechishlar: {NEXT_MIN} so‘mdan.\n"
-        "• Faqat real foydalanuvchilar hisoblanadi.\n"
-        f"• Kanalga a’zo bo‘lish majburiy: {CHANNEL} va {SECOND_CHANNEL}.\n"
-        f"• 24 soat ichida siz taklif qilgan foydalanuvchi kanaldan chiqsa, balansingizdan {PENALTY} so‘m jarima ayriladi.\n\n"
-        "❓ FAQ\n"
-        "• Mukofot qachon yoziladi? Do‘st kanalga a’zo bo‘lganda.\n"
-        "• Nega pul beriladi? Kanal auditoriyasi oshgani uchun.\n"
-        "• To‘lov manbai: homiy budjeti (majburiy kanallar)."
-    )
-
-@dp.message(StateFilter("*"), F.text == BTN_BACK)
-async def back_btn(m: types.Message, state: FSMContext):
-    await state.clear()
-    await m.reply("🏠 Asosiy menyu:", reply_markup=kb_main(m.from_user.id in ADMINS))
-
-# -------- Withdraw FSM
-def _is_any_menu(text: str | None) -> bool:
-    if not text: return False
-    t = text.strip()
-    return t in MAIN_BTNS or t in REF_BTNS
 
 @dp.message(WD.amount)
 async def wd_amount(m: types.Message, state: FSMContext):
@@ -658,10 +576,10 @@ async def wd_amount(m: types.Message, state: FSMContext):
         await m.reply("❗ Summani faqat raqam bilan yuboring."); return
     amt = int(digits)
     if m.from_user.id != TEST_USER_ID:
-        row = conn.execute("SELECT balance, has_withdrawn FROM users WHERE id=?", (m.from_user.id,)).fetchone()
-        bal = row[0] if row else 0
-        has_w = row[1] if row else 0
-        need = FIRST_MIN if has_w == 0 else NEXT_MIN
+        u = DB.get_user(m.from_user.id)
+        bal = (u or {}).get("balance", 0)
+        has_w = (u or {}).get("has_withdrawn", False)
+        need = FIRST_MIN if not has_w else NEXT_MIN
         if amt < need or amt > bal:
             await m.reply(f"❗ Noto‘g‘ri summa. Minimal {need}, maksimal {bal}."); return
     await state.update_data(amount=amt)
@@ -722,32 +640,21 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
     user_id = c.from_user.id
 
     if user_id != TEST_USER_ID:
-        row = conn.execute("SELECT balance, has_withdrawn FROM users WHERE id=?", (user_id,)).fetchone()
-        bal = row[0] if row else 0
+        u = DB.get_user(user_id)
+        bal = (u or {}).get("balance", 0)
         if amt <= 0 or amt > bal or len(card) != 16 or not fio:
             await state.clear()
             try: await c.message.edit_text("⚠️ Ma’lumotlar eskirgan. Qaytadan yuboring.")
             except Exception: pass
             await c.answer(); return
-        conn.execute("UPDATE users SET balance=balance-? WHERE id=?", (amt, user_id))
-        if (row[1] if row else 0) == 0:
-            conn.execute("UPDATE users SET has_withdrawn=1 WHERE id=?", (user_id,))
-        conn.commit()
+        DB.sub_balance_floor(user_id, amt)
+        DB.mark_first_withdrawn(user_id)
 
     now_uz = (datetime.datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute(
-        "INSERT INTO withdrawals(user_id,amount,card_number,full_name,created_at) VALUES(?,?,?,?,?)",
-        (user_id, amt, card, fio, now_uz)
-    )
-    conn.commit()
+    DB.insert_withdrawal(user_id, amt, card, fio, now_uz)
 
-    invited_rows = conn.execute("""
-        SELECT r.invited_id, u.username
-        FROM referrals r
-        LEFT JOIN users u ON u.id = r.invited_id
-        WHERE r.referrer_id=?
-        ORDER BY r.id DESC
-    """, (user_id,)).fetchall()
+    # takliflar ro‘yxati
+    invited_rows = DB.get_invited_by(user_id)
     inv_count = len(invited_rows)
     mentions = [mention(inv_id, uname) for inv_id, uname in invited_rows[:30]]
     more = inv_count - len(mentions)
@@ -759,8 +666,8 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
             + (f"\n… va yana <b>{more}</b> ta" if more > 0 else "")
         )
 
-    uname_row = conn.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
-    uname = uname_row[0] if uname_row else c.from_user.username
+    u = DB.get_user(user_id)
+    uname = (u or {}).get("username", c.from_user.username)
     masked = f"{card[:4]}****{card[4:8]}****{card[-4:]}"
     try:
         await bot.send_message(
@@ -789,6 +696,29 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
         pass
     await c.answer()
 
+# -------- Qoidalar
+@dp.message(StateFilter("*"), F.text == BTN_RULES)
+async def rules(m: types.Message, state: FSMContext):
+    if not await ensure_gate_and_clear_state(m, state): return
+    await m.reply(
+        "📜 Qoidalar\n"
+        f"• Har bir haqiqiy taklif uchun {AWARD} so‘m beriladi.\n"
+        f"• Birinchi yechib olish: {FIRST_MIN} so‘m. Keyingi yechishlar: {NEXT_MIN} so‘mdan.\n"
+        "• Faqat real foydalanuvchilar hisoblanadi.\n"
+        "• Kanallarga a’zo bo‘lish majburiy: @uyzar_elonlar va @zarafshon_kanal.\n"
+        f"• 24 soat ichida siz taklif qilgan foydalanuvchi kanallardan chiqsa, balansingizdan {PENALTY} so‘m jarima ayriladi.\n\n"
+        "❓ FAQ\n"
+        "• Mukofot qachon yoziladi? Do‘st kanallarga a’zo bo‘lganda.\n"
+        "• Nega pul beriladi? Kanal auditoriyasi oshgani uchun.\n"
+        "• Mukofotlar @uyzar_elonlar va @zarafshon_kanal budjetidan to‘lanadi.",
+        parse_mode="HTML"
+    )
+
+@dp.message(StateFilter("*"), F.text == BTN_BACK)
+async def back_btn(m: types.Message, state: FSMContext):
+    await state.clear()
+    await m.reply("🏠 Asosiy menyu:", reply_markup=kb_main(m.from_user.id in ADMINS))
+
 # -------- Admin panel
 @dp.message(StateFilter("*"), F.text == BTN_ADMIN)
 async def admin_panel(m: types.Message, state: FSMContext):
@@ -802,9 +732,9 @@ async def stats(m: types.Message, state: FSMContext):
     await state.clear()
     if m.from_user.id not in ADMINS:
         return
-    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    wd_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM withdrawals").fetchone()[0]
-    bal_sum = conn.execute("SELECT COALESCE(SUM(balance),0) FROM users WHERE id!=?", (TEST_USER_ID,)).fetchone()[0]
+    total_users = DB.count_users()
+    wd_users = DB.count_withdraw_users()
+    bal_sum = DB.sum_balances(exclude_id=TEST_USER_ID)
     await m.reply(
         "📊 Statistika\n"
         f"👥 Foydalanuvchilar: {total_users}\n"
@@ -842,7 +772,9 @@ async def bcast_confirm(c: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     mid = data.get("mid")
     chat = data.get("chat")
-    users = [r[0] for r in conn.execute("SELECT id FROM users").fetchall()]
+    # Eslatma: ko‘p foydalanuvchida paginatsiya/RPC ishlatish tavsiya etiladi
+    r = sb.table(TBL_USERS).select("id").execute()
+    users = [row["id"] for row in (r.data or [])]
     sent = 0; fail = 0
     for uid in users:
         try:
@@ -863,28 +795,32 @@ async def active_referrers(m: types.Message, state: FSMContext):
     await state.clear()
     if m.from_user.id not in ADMINS:
         return
-    rows = conn.execute("""
-        SELECT referrer_id, COUNT(*) AS cnt
-        FROM referrals
-        GROUP BY referrer_id
-        HAVING cnt > 0
-        ORDER BY cnt DESC
-    """).fetchall()
-    if not rows:
+    # Guruhlash: PostgREST da RPC qulay, lekin soddalik uchun client-side:
+    r = sb.table(TBL_REFS).select("referrer_id").execute()
+    counts: Dict[int, int] = {}
+    for row in (r.data or []):
+        rid = row["referrer_id"]
+        counts[rid] = counts.get(rid, 0) + 1
+    if not counts:
         await m.reply("📉 Hozircha faol referrerlar yo‘q.")
         return
+    # top by count
+    sorted_rows = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    ids = [rid for rid, _ in sorted_rows]
+    u = sb.table(TBL_USERS).select("id,username").in_("id", ids).execute()
+    umap = {row["id"]: row.get("username") for row in (u.data or [])}
+
     text = "📈 Faol referrerlar:\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for ref_id, cnt in rows:
-        u = conn.execute("SELECT username FROM users WHERE id=?", (ref_id,)).fetchone()
-        uname = u[0] if u else None
+    for rid, cnt in sorted_rows:
+        uname = umap.get(rid)
         if uname:
             text += f"• @{uname}: {cnt} ta do‘st\n"
             kb.inline_keyboard.append([InlineKeyboardButton(text=f"@{uname}", url=f"https://t.me/{uname}")])
         else:
-            clickable_id = mention(ref_id, None, fb=f"ID {ref_id}")
+            clickable_id = mention(rid, None, fb=f"ID {rid}")
             text += f"• {clickable_id}: {cnt} ta do‘st\n"
-            kb.inline_keyboard.append([InlineKeyboardButton(text=f"ID {ref_id}", url=f"tg://user?id={ref_id}")])
+            kb.inline_keyboard.append([InlineKeyboardButton(text=f"ID {rid}", url=f"tg://user?id={rid}")])
     await m.reply(text, reply_markup=kb, parse_mode="HTML")
 
 # ================== RUN ==================
