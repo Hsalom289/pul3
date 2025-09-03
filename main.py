@@ -156,13 +156,10 @@ class DB:
 
     @staticmethod
     def get_invited_by(referrer_id: int) -> List[Tuple[int, Optional[str]]]:
-        # 1) referrals
         r = sb.table(TBL_REFS).select("invited_id").eq("referrer_id", referrer_id).order("id", desc=True).execute()
         ids = [row["invited_id"] for row in (r.data or [])]
         if not ids:
             return []
-        # 2) usernames
-        # split in chunks (PostgREST 'in' limited length), but for simplicity once:
         u = sb.table(TBL_USERS).select("id,username").in_("id", ids).execute()
         umap = {row["id"]: row.get("username") for row in (u.data or [])}
         return [(i, umap.get(i)) for i in ids]
@@ -199,8 +196,11 @@ class DB:
     # ---- STATS ----
     @staticmethod
     def count_users() -> int:
-        r = sb.table(TBL_USERS).select("id", count="exact", head=True).execute()
-        return r.count or 0
+        # FIX: supabase-py v2 da select(..., head=True) parametri yo‘q.
+        # count='exact' yetarli; r.count orqali aniq son olinadi.
+        r = sb.table(TBL_USERS).select("id", count="exact").execute()
+        # Ba’zi muhitlarda count None bo‘lsa, fallback: data uzunligi
+        return (r.count if r.count is not None else len(r.data or [])) or 0
 
     @staticmethod
     def count_withdraw_users() -> int:
@@ -236,7 +236,7 @@ async def check_pendings():
                 DB.mark_referral_done(rid)
                 continue
 
-            # Ikkala kanal bo‘yicha tekshiruv: istalgan birida a’zo bo‘lmasa → jarima
+            # Ikkala kanal bo‘yicha tekshiruv
             in_all = True
             for ch in MANDATORY_CHANNELS:
                 try:
@@ -251,7 +251,6 @@ async def check_pendings():
             if not in_all:
                 DB.sub_balance_floor(ref_id, PENALTY)
                 DB.mark_referral_penalized(rid)
-                # Taklifchiga xabar
                 u = DB.get_user(inv_id)
                 uname = u.get("username") if u else None
                 try:
@@ -772,7 +771,6 @@ async def bcast_confirm(c: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     mid = data.get("mid")
     chat = data.get("chat")
-    # Eslatma: ko‘p foydalanuvchida paginatsiya/RPC ishlatish tavsiya etiladi
     r = sb.table(TBL_USERS).select("id").execute()
     users = [row["id"] for row in (r.data or [])]
     sent = 0; fail = 0
@@ -795,7 +793,6 @@ async def active_referrers(m: types.Message, state: FSMContext):
     await state.clear()
     if m.from_user.id not in ADMINS:
         return
-    # Guruhlash: PostgREST da RPC qulay, lekin soddalik uchun client-side:
     r = sb.table(TBL_REFS).select("referrer_id").execute()
     counts: Dict[int, int] = {}
     for row in (r.data or []):
@@ -804,7 +801,6 @@ async def active_referrers(m: types.Message, state: FSMContext):
     if not counts:
         await m.reply("📉 Hozircha faol referrerlar yo‘q.")
         return
-    # top by count
     sorted_rows = sorted(counts.items(), key=lambda x: x[1], reverse=True)
     ids = [rid for rid, _ in sorted_rows]
     u = sb.table(TBL_USERS).select("id,username").in_("id", ids).execute()
