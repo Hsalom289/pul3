@@ -7,7 +7,6 @@ import logging
 import datetime
 from datetime import timedelta
 import urllib.parse
-import os
 from typing import Optional, Dict, List, Tuple
 
 from aiogram import Bot, Dispatcher, types, F
@@ -28,13 +27,9 @@ logging.basicConfig(level=logging.INFO)
 # ================== CONFIG ==================
 TOKEN = "8436934185:AAGWATHLhZ0B04TDi79OoULLDAMJ4w78-Ik"
 CHANNEL = "@uyzar_elonlar"
-
-# YANGI majburiy kanal
 SECOND_CHANNEL = "@zarafshon_kanal"
-# Ikkala kanal ro‘yxati (gate va penalty shu ro‘yxat bo‘yicha ishlaydi)
 MANDATORY_CHANNELS = [CHANNEL, SECOND_CHANNEL]
 
-# Majburiy bot (faqat /start bosilganini tekshirish uchun)
 HELPER_BOT_USERNAME = "@uyzarbot"
 HELPER_BOT_TOKEN = "7009289954:AAEssEXV8cZSGAKOShmFNiJMO2ldgJU5Nl4"
 
@@ -42,19 +37,20 @@ ADMINS = [1217732736, 6374979572]
 TEST_USER_ID = 6374979572
 TEST_USER_BALANCE = 1_000_000
 
-WITHDRAW_GROUP_ID = -1002938188891  # yechib olish so'rovlari guruhiga yuboriladi
+WITHDRAW_GROUP_ID = -1002938188891
 
-AWARD = 500        # 500 so‘m
+AWARD = 500
 PENALTY = 100
-FIRST_MIN = 1000
-NEXT_MIN = 5000
+
+# Bosqichli yechib olish limitlari
+WITHDRAW_TIERS = [1000, 5000, 8000, 11000, 15000]  # 1..5; keyin ham 15000
 
 # ---------- SUPABASE ----------
 SUPABASE_URL = "https://bnuleyjyjdwvkzwcyalf.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJudWxleWp5amR3dmt6d2N5YWxmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDkzMDE5ODMsImV4cCI6MjAyNDg3Nzk4M30.UG-EKAXRYDDZANFwOKhM_0daycSutmC3DBqf-SLy3SU"
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Jadval nomlari (Siz bergan sxemaga mos)
+# Jadval nomlari
 TBL_USERS = "userpul"
 TBL_REFS = "referralpul"
 TBL_WITHDRAWS = "withdrawpul"
@@ -78,7 +74,7 @@ REF_BTNS  = {BTN_LINK, BTN_BALANCE, BTN_WITHDRAW, BTN_RULES, BTN_BACK}
 
 # ================== BOT ==================
 bot = Bot(token=TOKEN)
-helper_bot = Bot(token=HELPER_BOT_TOKEN)  # faqat tekshiruv uchun
+helper_bot = Bot(token=HELPER_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 BOT_USERNAME = None
 
@@ -107,6 +103,12 @@ class DB:
         }, on_conflict="id").execute()
 
     @staticmethod
+    def set_referrer_if_empty(uid: int, referrer_id: int):
+        u = DB.get_user(uid)
+        if u and (u.get("referrer_id") is None):
+            sb.table(TBL_USERS).update({"referrer_id": referrer_id}).eq("id", uid).execute()
+
+    @staticmethod
     def update_username(uid: int, username: Optional[str]):
         sb.table(TBL_USERS).update({"username": username}).eq("id", uid).execute()
 
@@ -125,10 +127,14 @@ class DB:
         sb.table(TBL_USERS).update({"balance": newv}).eq("id", uid).execute()
 
     @staticmethod
-    def mark_first_withdrawn(uid: int):
-        u = DB.get_user(uid)
-        if u and not u.get("has_withdrawn", False):
-            sb.table(TBL_USERS).update({"has_withdrawn": True}).eq("id", uid).execute()
+    def get_withdraw_count(uid: int) -> int:
+        r = sb.table(TBL_WITHDRAWS).select("id", count="exact").eq("user_id", uid).execute()
+        return (r.count if r.count is not None else len(r.data or [])) or 0
+
+    @staticmethod
+    def next_withdraw_min(uid: int) -> int:
+        c = DB.get_withdraw_count(uid)
+        return WITHDRAW_TIERS[c] if c < len(WITHDRAW_TIERS) else WITHDRAW_TIERS[-1]
 
     # ---- REFERRALS ----
     @staticmethod
@@ -140,6 +146,11 @@ class DB:
             "penalized": False,
             "done": False
         }).execute()
+
+    @staticmethod
+    def has_referral(referrer_id: int, invited_id: int) -> bool:
+        r = sb.table(TBL_REFS).select("id").eq("referrer_id", referrer_id).eq("invited_id", invited_id).limit(1).execute()
+        return bool(r.data)
 
     @staticmethod
     def open_referrals() -> List[Dict]:
@@ -196,10 +207,7 @@ class DB:
     # ---- STATS ----
     @staticmethod
     def count_users() -> int:
-        # FIX: supabase-py v2 da select(..., head=True) parametri yo‘q.
-        # count='exact' yetarli; r.count orqali aniq son olinadi.
         r = sb.table(TBL_USERS).select("id", count="exact").execute()
-        # Ba’zi muhitlarda count None bo‘lsa, fallback: data uzunligi
         return (r.count if r.count is not None else len(r.data or [])) or 0
 
     @staticmethod
@@ -216,62 +224,29 @@ class DB:
         r = q.execute()
         return sum((row.get("balance", 0) or 0) for row in (r.data or []))
 
-# ================== PENALTY MONITOR (24h) ==================
-async def check_pendings():
-    while True:
-        await asyncio.sleep(600)  # 10 daqiqa
-        now = datetime.datetime.utcnow()
-        rows = DB.open_referrals()
-        for ref in rows:
-            rid = ref["id"]
-            ref_id = ref["referrer_id"]
-            inv_id = ref["invited_id"]
-            jt = ref.get("join_time")
-            try:
-                join_t = datetime.datetime.fromisoformat(jt.replace("Z","")) if isinstance(jt, str) else now
-            except Exception:
-                join_t = now
-            hours = (now - join_t.replace(tzinfo=None)).total_seconds() / 3600 if isinstance(join_t, datetime.datetime) else 0
-            if hours > 24:
-                DB.mark_referral_done(rid)
-                continue
-
-            # Ikkala kanal bo‘yicha tekshiruv
-            in_all = True
-            for ch in MANDATORY_CHANNELS:
-                try:
-                    m = await bot.get_chat_member(ch, inv_id)
-                    if m.status not in ["member", "administrator", "creator"]:
-                        in_all = False
-                        break
-                except Exception:
-                    in_all = False
-                    break
-
-            if not in_all:
-                DB.sub_balance_floor(ref_id, PENALTY)
-                DB.mark_referral_penalized(rid)
-                u = DB.get_user(inv_id)
-                uname = u.get("username") if u else None
-                try:
-                    await bot.send_message(
-                        ref_id,
-                        "⚠️ {usr} majburiy kanallardan biridan 24 soat ichida chiqib ketdi.\n"
-                        f"−{PENALTY} so‘m balansingizdan ayirildi."
-                        .format(usr=mention(inv_id, uname)),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                except Exception:
-                    pass
-
-# ================== GATE (KANALLAR + MAJBURIY BOT) ==================
+# ================== FAST MEMBERSHIP CHECK ==================
 async def has_started_helper(user_id: int) -> bool:
     try:
         await helper_bot.send_chat_action(user_id, "typing")
         return True
     except Exception:
         return False
+
+async def channels_status(user_id: int) -> Dict[str, bool]:
+    async def one(ch: str):
+        try:
+            cm = await bot.get_chat_member(ch, user_id)
+            return cm.status in ("member", "administrator", "creator")
+        except Exception:
+            return False
+    tasks = [one(ch) for ch in MANDATORY_CHANNELS]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return {ch: ok for ch, ok in zip(MANDATORY_CHANNELS, results)}
+
+async def gate_ok(user_id: int) -> bool:
+    chs = await channels_status(user_id)
+    helper_ok = await has_started_helper(user_id)
+    return all(chs.values()) and helper_ok
 
 def gate_keyboard() -> InlineKeyboardMarkup:
     rows = [
@@ -282,21 +257,6 @@ def gate_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="gate_check")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def gate_ok(user_id: int) -> bool:
-    in_all_channels = True
-    for ch in MANDATORY_CHANNELS:
-        try:
-            cm = await bot.get_chat_member(ch, user_id)
-            if cm.status not in ["member", "administrator", "creator"]:
-                in_all_channels = False
-                break
-        except Exception:
-            in_all_channels = False
-            break
-    started_helper = await has_started_helper(user_id)
-    return in_all_channels and started_helper
-
-# ================== KEYBOARDS ==================
 def kb_main(is_admin: bool):
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_REF_MAIN), KeyboardButton(text=BTN_HELP))
@@ -358,10 +318,8 @@ def parse_ref_arg(arg: Optional[str]) -> Optional[int]:
     if a.startswith("ref_"):
         a = a.split("ref_", 1)[1]
     if a.isdigit():
-        try:
-            return int(a)
-        except Exception:
-            return None
+        try: return int(a)
+        except Exception: return None
     return None
 
 def upsert_pending_ref(referee_id: int, referrer_id: Optional[int]):
@@ -383,19 +341,49 @@ WELCOME = (
     "👇 Pastdagi tugmalardan foydalaning."
 )
 
-# =============== UNIVERSAL: har qanday menyu tugmasi bosilganda FSM tozalash ===============
 async def ensure_gate_and_clear_state(message: types.Message, state: FSMContext) -> bool:
     await state.clear()
     if not await gate_ok(message.from_user.id):
+        chs = await channels_status(message.from_user.id)
+        missing = [ch for ch, ok in chs.items() if not ok]
+        miss_txt = ("❗ Hali a’zo emassiz: " + ", ".join(missing)) if missing else ""
         await message.reply(
             "🔐 <b>Kirishdan oldin</b>\n"
             f"1) 🤖 <b>Majburiy bot</b>: {HELPER_BOT_USERNAME} ni ochib <b>/start</b> bosing.\n"
             f"2) 📢 <b>Kanal</b>: {CHANNEL} <b>va</b> {SECOND_CHANNEL} ga a’zo bo‘ling.\n"
-            "3) So‘ng <b>✅ Tekshirish</b> tugmasini bosing.",
+            "3) So‘ng <b>✅ Tekshirish</b> tugmasini bosing.\n\n" + miss_txt,
             reply_markup=gate_keyboard(),
             parse_mode="HTML"
         )
         return False
+    return True
+
+# === Award helper (faqat bir marta) ===
+async def award_referral_once(invited_id: int, referrer_id: int) -> bool:
+    """Gate OK bo‘lganda chaqiriladi. Oldin berilmagan bo‘lsa +ref va +AWARD qiladi."""
+    if referrer_id == invited_id:
+        return False
+    if not DB.get_user(referrer_id) or not DB.get_user(invited_id):
+        return False
+    if DB.has_referral(referrer_id, invited_id):
+        return False
+    # invited referrer_id boshqa bo‘lsa — hurmat qilamiz, yo‘q bo‘lsa o‘rnatamiz
+    DB.set_referrer_if_empty(invited_id, referrer_id)
+    DB.add_balance(referrer_id, AWARD)
+    DB.insert_referral(referrer_id, invited_id, datetime.datetime.utcnow().isoformat())
+    # xabar taklifchiga
+    try:
+        u = DB.get_user(invited_id)
+        await bot.send_message(
+            referrer_id,
+            "🆕 <b>Yangi referral</b>\n"
+            f"🧑‍🤝‍🧑 Yangi a’zo: {mention(invited_id, (u or {}).get('username'))} (ID: <code>{invited_id}</code>)\n"
+            f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
     return True
 
 # ================== HANDLERS ==================
@@ -407,6 +395,12 @@ async def start(m: types.Message, state: FSMContext):
     if ref_from_link:
         upsert_pending_ref(m.from_user.id, ref_from_link)
 
+    # foydalanuvchini darhol DBga yozamiz / yangilaymiz
+    if not DB.get_user(m.from_user.id):
+        DB.insert_user(m.from_user.id, m.from_user.username, None)
+    else:
+        DB.update_username(m.from_user.id, m.from_user.username)
+
     if not await gate_ok(m.from_user.id):
         await m.reply(
             "🔐 <b>Kirishdan oldin</b>\n"
@@ -416,29 +410,11 @@ async def start(m: types.Message, state: FSMContext):
             reply_markup=gate_keyboard(),
             parse_mode="HTML"
         )
-        return
-
-    user_row = DB.get_user(m.from_user.id)
-    final_ref = pop_pending_ref(m.from_user.id) or ref_from_link
-
-    if not user_row:
-        if final_ref and final_ref != m.from_user.id and DB.get_user(final_ref):
-            DB.add_balance(final_ref, AWARD)
-            DB.insert_referral(final_ref, m.from_user.id, datetime.datetime.utcnow().isoformat())
-            try:
-                await bot.send_message(
-                    final_ref,
-                    "🆕 <b>Yangi referral</b>\n"
-                    f"🧑‍🤝‍🧑 Yangi a’zo: {mention(m.from_user.id, m.from_user.username)} (ID: <code>{m.from_user.id}</code>)\n"
-                    f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-            except Exception:
-                pass
-        DB.insert_user(m.from_user.id, m.from_user.username, final_ref)
     else:
-        DB.update_username(m.from_user.id, m.from_user.username)
+        # Gate OK → referalni faqat bir marta kreditlash
+        final_ref = pop_pending_ref(m.from_user.id) or ref_from_link
+        if final_ref:
+            await award_referral_once(m.from_user.id, final_ref)
 
     text = WELCOME.format(
         name=esc(m.from_user.full_name or ""),
@@ -452,25 +428,14 @@ async def gate_recheck(c: types.CallbackQuery):
         await c.answer("Hali shartlar bajarilmadi.", show_alert=True)
         return
 
-    user_row = DB.get_user(c.from_user.id)
+    # Gate OK → referalni faqat bir marta kreditlash
+    if not DB.get_user(c.from_user.id):
+        DB.insert_user(c.from_user.id, c.from_user.username, None)
+    else:
+        DB.update_username(c.from_user.id, c.from_user.username)
     final_ref = pop_pending_ref(c.from_user.id)
-
-    if not user_row:
-        if final_ref and final_ref != c.from_user.id and DB.get_user(final_ref):
-            DB.add_balance(final_ref, AWARD)
-            DB.insert_referral(final_ref, c.from_user.id, datetime.datetime.utcnow().isoformat())
-            try:
-                await bot.send_message(
-                    final_ref,
-                    "🆕 <b>Yangi referral</b>\n"
-                    f"🧑‍🤝‍🧑 Yangi a’zo: {mention(c.from_user.id, c.from_user.username)} (ID: <code>{c.from_user.id}</code>)\n"
-                    f"💰 Balansga +{AWARD} so‘m qo‘shildi.",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
-                )
-            except Exception:
-                pass
-        DB.insert_user(c.from_user.id, c.from_user.username, final_ref)
+    if final_ref:
+        await award_referral_once(c.from_user.id, final_ref)
 
     try:
         await c.message.edit_text("✅ Tekshirildi. Davom etishingiz mumkin.")
@@ -530,8 +495,7 @@ async def my_balance(m: types.Message, state: FSMContext):
         return
     u = DB.get_user(m.from_user.id)
     bal = (u or {}).get("balance", 0)
-    has_w = (u or {}).get("has_withdrawn", False)
-    need = FIRST_MIN if not has_w else NEXT_MIN
+    need = DB.next_withdraw_min(m.from_user.id)
     status = "✅ Hozir yechishingiz mumkin." if bal >= need else "⏳ Hali yetarli emas."
     await m.reply(f"💰 Balans: {bal} so‘m\n🎯 Minimal yechish: {need} so‘m\n{status}")
 
@@ -554,10 +518,8 @@ async def wd_start(m: types.Message, state: FSMContext):
         await state.set_state(WD.amount)
         await m.reply(f"♾️ Test balans: {TEST_USER_BALANCE:,} so‘m.\n💸 Qancha yechamiz? Summani raqam bilan yuboring.".replace(",", " "))
         return
-    u = DB.get_user(m.from_user.id)
-    bal = (u or {}).get("balance", 0)
-    has_w = (u or {}).get("has_withdrawn", False)
-    need = FIRST_MIN if not has_w else NEXT_MIN
+    need = DB.next_withdraw_min(m.from_user.id)
+    bal = (DB.get_user(m.from_user.id) or {}).get("balance", 0)
     if bal < need:
         await m.reply(f"⚠️ Minimal yechib olish: {need} so‘m.\n💰 Sizda hozir: {bal} so‘m.")
         return
@@ -575,10 +537,8 @@ async def wd_amount(m: types.Message, state: FSMContext):
         await m.reply("❗ Summani faqat raqam bilan yuboring."); return
     amt = int(digits)
     if m.from_user.id != TEST_USER_ID:
-        u = DB.get_user(m.from_user.id)
-        bal = (u or {}).get("balance", 0)
-        has_w = (u or {}).get("has_withdrawn", False)
-        need = FIRST_MIN if not has_w else NEXT_MIN
+        need = DB.next_withdraw_min(m.from_user.id)
+        bal = (DB.get_user(m.from_user.id) or {}).get("balance", 0)
         if amt < need or amt > bal:
             await m.reply(f"❗ Noto‘g‘ri summa. Minimal {need}, maksimal {bal}."); return
     await state.update_data(amount=amt)
@@ -639,20 +599,17 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
     user_id = c.from_user.id
 
     if user_id != TEST_USER_ID:
-        u = DB.get_user(user_id)
-        bal = (u or {}).get("balance", 0)
-        if amt <= 0 or amt > bal or len(card) != 16 or not fio:
+        need = DB.next_withdraw_min(user_id)
+        bal = (DB.get_user(user_id) or {}).get("balance", 0)
+        if amt < need or amt > bal or len(card) != 16 or not fio:
             await state.clear()
-            try: await c.message.edit_text("⚠️ Ma’lumotlar eskirgan. Qaytadan yuboring.")
+            try: await c.message.edit_text("⚠️ Ma’lumotlar eskirgan yoki limit mos emas. Qaytadan yuboring.")
             except Exception: pass
             await c.answer(); return
         DB.sub_balance_floor(user_id, amt)
-        DB.mark_first_withdrawn(user_id)
+        now_uz_iso = (datetime.datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S")
+        DB.insert_withdrawal(user_id, amt, card, fio, now_uz_iso)
 
-    now_uz = (datetime.datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S")
-    DB.insert_withdrawal(user_id, amt, card, fio, now_uz)
-
-    # takliflar ro‘yxati
     invited_rows = DB.get_invited_by(user_id)
     inv_count = len(invited_rows)
     mentions = [mention(inv_id, uname) for inv_id, uname in invited_rows[:30]]
@@ -676,7 +633,7 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
             f"💰 Summа: <b>{amt}</b>\n"
             f"💳 Karta: <code>{masked}</code>\n"
             f"👤 F.I.Sh: <b>{esc(fio)}</b>\n"
-            f"🕒 {now_uz}"
+            f"🕒 {(datetime.datetime.utcnow() + timedelta(hours=5)).strftime('%Y-%m-%d %H:%M:%S')}"
             f"{invited_block}",
             parse_mode="HTML",
             disable_web_page_preview=True
@@ -695,14 +652,15 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
         pass
     await c.answer()
 
-# -------- Qoidalar
+# -------- Qoidalar (bosqichli limitlar qo‘shildi)
 @dp.message(StateFilter("*"), F.text == BTN_RULES)
 async def rules(m: types.Message, state: FSMContext):
     if not await ensure_gate_and_clear_state(m, state): return
+    tiers_text = " → ".join(str(x) for x in WITHDRAW_TIERS)
     await m.reply(
         "📜 Qoidalar\n"
         f"• Har bir haqiqiy taklif uchun {AWARD} so‘m beriladi.\n"
-        f"• Birinchi yechib olish: {FIRST_MIN} so‘m. Keyingi yechishlar: {NEXT_MIN} so‘mdan.\n"
+        f"• Yechib olish bosqichlari: {tiers_text} (keyingi safarlar ham 15000 so‘mdan).\n"
         "• Faqat real foydalanuvchilar hisoblanadi.\n"
         "• Kanallarga a’zo bo‘lish majburiy: @uyzar_elonlar va @zarafshon_kanal.\n"
         f"• 24 soat ichida siz taklif qilgan foydalanuvchi kanallardan chiqsa, balansingizdan {PENALTY} so‘m jarima ayriladi.\n\n"
@@ -810,14 +768,56 @@ async def active_referrers(m: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for rid, cnt in sorted_rows:
         uname = umap.get(rid)
+        # Matnda hamisha mention() — username bo‘lmasa lichka linki
+        text += f"• {mention(rid, uname)}: {cnt} ta do‘st\n"
+        # Tugma: username bo‘lsa t.me, bo‘lmasa tg://user
         if uname:
-            text += f"• @{uname}: {cnt} ta do‘st\n"
             kb.inline_keyboard.append([InlineKeyboardButton(text=f"@{uname}", url=f"https://t.me/{uname}")])
         else:
-            clickable_id = mention(rid, None, fb=f"ID {rid}")
-            text += f"• {clickable_id}: {cnt} ta do‘st\n"
             kb.inline_keyboard.append([InlineKeyboardButton(text=f"ID {rid}", url=f"tg://user?id={rid}")])
     await m.reply(text, reply_markup=kb, parse_mode="HTML")
+
+# ================== PENALTY MONITOR (24h) ==================
+async def check_pendings():
+    while True:
+        await asyncio.sleep(60)  # 10 daqiqa
+        now = datetime.datetime.utcnow()
+        rows = DB.open_referrals()
+        for ref in rows:
+            rid = ref["id"]
+            ref_id = ref["referrer_id"]
+            inv_id = ref["invited_id"]
+            jt = ref.get("join_time")
+            try:
+                join_t = datetime.datetime.fromisoformat(jt.replace("Z","")) if isinstance(jt, str) else now
+            except Exception:
+                join_t = now
+            hours = (now - join_t.replace(tzinfo=None)).total_seconds() / 3600 if isinstance(join_t, datetime.datetime) else 0
+            if hours > 24:
+                DB.mark_referral_done(rid)
+                continue
+
+            chs = await channels_status(inv_id)
+            in_all = all(chs.values())
+
+            if not in_all:
+                DB.sub_balance_floor(ref_id, PENALTY)
+                DB.mark_referral_penalized(rid)
+                u = DB.get_user(inv_id)
+                uname = u.get("username") if u else None
+                missing = [ch for ch, ok in chs.items() if not ok]
+                miss_txt = ", ".join(missing) if missing else "majburiy kanal"
+                try:
+                    await bot.send_message(
+                        ref_id,
+                        ("⚠️ {usr} quyidagi kanal(lar)dan 24 soat ichida chiqib ketdi: "
+                         f"<b>{miss_txt}</b>\n−{PENALTY} so‘m balansingizdan ayirildi.")
+                        .format(usr=mention(inv_id, uname)),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                except Exception:
+                    pass
 
 # ================== RUN ==================
 async def main():
@@ -826,4 +826,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
