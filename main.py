@@ -33,7 +33,7 @@ MANDATORY_CHANNELS = [CHANNEL, SECOND_CHANNEL]
 HELPER_BOT_USERNAME = "@uyzarbot"
 HELPER_BOT_TOKEN = "7009289954:AAEssEXV8cZSGAKOShmFNiJMO2ldgJU5Nl4"
 
-ADMINS = [1217732736, 6374979572, 1470004227]
+ADMINS = [1217732736, 6374979572]
 TEST_USER_ID = 6374979572
 TEST_USER_BALANCE = 1_000_000
 
@@ -569,14 +569,13 @@ async def wd_name(m: types.Message, state: FSMContext):
         await m.reply("❗ Ism Familiyani to‘liq yuboring."); return
     data = await state.get_data()
     amt = int(data["amount"])
-    card = data["card"]
-    masked = f"{card[:4]}****{card[4:8]}****{card[-4:]}"
+    card = data["card"]  # TO‘LIQ KARTA
     await state.update_data(name=fio)
     await state.set_state(WD.confirm)
     await m.reply(
         "🧾 <b>So‘rov</b>\n"
         f"• 💰 Summа: <b>{amt}</b>\n"
-        f"• 💳 Karta: <b>{masked}</b>\n"
+        f"• 💳 Karta: <b>{card}</b>\n"  # TO‘LIQ KARTA KO‘RSATILADI
         f"• 👤 F.I.Sh: <b>{esc(fio)}</b>\n\n"
         "Tasdiqlaysizmi?",
         parse_mode="HTML",
@@ -594,7 +593,7 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     amt = int(data.get("amount", 0))
-    card = data.get("card", "")
+    card = data.get("card", "")  # TO‘LIQ KARTA
     fio = data.get("name", "")
     user_id = c.from_user.id
 
@@ -624,14 +623,13 @@ async def wd_confirm(c: types.CallbackQuery, state: FSMContext):
 
     u = DB.get_user(user_id)
     uname = (u or {}).get("username", c.from_user.username)
-    masked = f"{card[:4]}****{card[4:8]}****{card[-4:]}"
     try:
         await bot.send_message(
             WITHDRAW_GROUP_ID,
             "💸 <b>Yangi yechib olish</b>\n"
             f"👤 Foydalanuvchi: {mention(user_id, uname)} (ID: <code>{user_id}</code>)\n"
             f"💰 Summа: <b>{amt}</b>\n"
-            f"💳 Karta: <code>{masked}</code>\n"
+            f"💳 Karta: <code>{card}</code>\n"  # TO‘LIQ KARTA CHEKDA
             f"👤 F.I.Sh: <b>{esc(fio)}</b>\n"
             f"🕒 {(datetime.datetime.utcnow() + timedelta(hours=5)).strftime('%Y-%m-%d %H:%M:%S')}"
             f"{invited_block}",
@@ -780,7 +778,7 @@ async def active_referrers(m: types.Message, state: FSMContext):
 # ================== PENALTY MONITOR (24h) ==================
 async def check_pendings():
     while True:
-        await asyncio.sleep(60)  # 10 daqiqa
+        await asyncio.sleep(60)  # 10 daqiqa -> hozir 60s
         now = datetime.datetime.utcnow()
         rows = DB.open_referrals()
         for ref in rows:
@@ -826,4 +824,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
